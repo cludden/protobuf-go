@@ -20,7 +20,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-type marshalFunc func(encoder, protoreflect.Message) error
+type marshalFunc func(encoder, protoreflect.Message, any) error
 
 // wellKnownTypeMarshaler returns a marshal function if the message type
 // has specialized serialization behavior. It returns nil otherwise.
@@ -102,7 +102,7 @@ func wellKnownTypeUnmarshaler(name protoreflect.FullName) unmarshalFunc {
 // custom JSON representation, that representation will be embedded adding a
 // field `value` which holds the custom JSON in addition to the `@type` field.
 
-func (e encoder) marshalAny(m protoreflect.Message) error {
+func (e encoder) marshalAny(m protoreflect.Message, v any) error {
 	fds := m.Descriptor().Fields()
 	fdType := fds.ByNumber(genid.Any_TypeUrl_field_number)
 	fdValue := fds.ByNumber(genid.Any_Value_field_number)
@@ -152,7 +152,7 @@ func (e encoder) marshalAny(m protoreflect.Message) error {
 		}
 
 		e.WriteName("value")
-		return marshal(e, em)
+		return marshal(e, em, v)
 	}
 
 	// Else, marshal out the embedded message's fields in this Any object.
@@ -383,10 +383,10 @@ func (d decoder) unmarshalAnyValue(unmarshal unmarshalFunc, m protoreflect.Messa
 
 // Wrapper types are encoded as JSON primitives like string, number or boolean.
 
-func (e encoder) marshalWrapperType(m protoreflect.Message) error {
+func (e encoder) marshalWrapperType(m protoreflect.Message, v any) error {
 	fd := m.Descriptor().Fields().ByNumber(genid.WrapperValue_Value_field_number)
 	val := m.Get(fd)
-	return e.marshalSingular(val, fd)
+	return e.marshalSingular(val, v, fd)
 }
 
 func (d decoder) unmarshalWrapperType(m protoreflect.Message) error {
@@ -395,13 +395,13 @@ func (d decoder) unmarshalWrapperType(m protoreflect.Message) error {
 	if err != nil {
 		return err
 	}
-	m.Set(fd, val)
+	m.Set(fd, protoreflect.ValueOf(val))
 	return nil
 }
 
 // The JSON representation for Empty is an empty JSON object.
 
-func (e encoder) marshalEmpty(protoreflect.Message) error {
+func (e encoder) marshalEmpty(protoreflect.Message, any) error {
 	e.StartObject()
 	e.EndObject()
 	return nil
@@ -443,9 +443,9 @@ func (d decoder) unmarshalEmpty(protoreflect.Message) error {
 // The JSON representation for Struct is a JSON object that contains the encoded
 // Struct.fields map and follows the serialization rules for a map.
 
-func (e encoder) marshalStruct(m protoreflect.Message) error {
+func (e encoder) marshalStruct(m protoreflect.Message, v any) error {
 	fd := m.Descriptor().Fields().ByNumber(genid.Struct_Fields_field_number)
-	return e.marshalMap(m.Get(fd).Map(), fd)
+	return e.marshalMap(m.Get(fd).Map(), v, fd)
 }
 
 func (d decoder) unmarshalStruct(m protoreflect.Message) error {
@@ -457,9 +457,9 @@ func (d decoder) unmarshalStruct(m protoreflect.Message) error {
 // ListValue.values repeated field and follows the serialization rules for a
 // repeated field.
 
-func (e encoder) marshalListValue(m protoreflect.Message) error {
+func (e encoder) marshalListValue(m protoreflect.Message, v any) error {
 	fd := m.Descriptor().Fields().ByNumber(genid.ListValue_Values_field_number)
-	return e.marshalList(m.Get(fd).List(), fd)
+	return e.marshalList(m.Get(fd).List(), v, fd)
 }
 
 func (d decoder) unmarshalListValue(m protoreflect.Message) error {
@@ -471,7 +471,7 @@ func (d decoder) unmarshalListValue(m protoreflect.Message) error {
 // set. Each of the field in the oneof has its own custom serialization rule. A
 // Value message needs to be a oneof field set, else it is an error.
 
-func (e encoder) marshalKnownValue(m protoreflect.Message) error {
+func (e encoder) marshalKnownValue(m protoreflect.Message, v any) error {
 	od := m.Descriptor().Oneofs().ByName(genid.Value_Kind_oneof_name)
 	fd := m.WhichOneof(od)
 	if fd == nil {
@@ -482,7 +482,7 @@ func (e encoder) marshalKnownValue(m protoreflect.Message) error {
 			return errors.New("%s: invalid %v value", genid.Value_NumberValue_field_fullname, v)
 		}
 	}
-	return e.marshalSingular(m.Get(fd), fd)
+	return e.marshalSingular(m.Get(fd), v, fd)
 }
 
 func (d decoder) unmarshalKnownValue(m protoreflect.Message) error {
@@ -514,10 +514,12 @@ func (d decoder) unmarshalKnownValue(m protoreflect.Message) error {
 		}
 		fd = m.Descriptor().Fields().ByNumber(genid.Value_NumberValue_field_number)
 		var ok bool
-		val, ok = unmarshalFloat(tok, 64)
+		var tmp any
+		tmp, ok = unmarshalFloat(tok, 64)
 		if !ok {
 			return d.newError(tok.Pos(), "invalid %v: %v", genid.Value_message_fullname, tok.RawString())
 		}
+		val = protoreflect.ValueOf(tmp)
 
 	case json.String:
 		// A JSON string may have been encoded from the number_value field,
@@ -572,7 +574,7 @@ const (
 	maxSecondsInDuration = 315576000000
 )
 
-func (e encoder) marshalDuration(m protoreflect.Message) error {
+func (e encoder) marshalDuration(m protoreflect.Message, v any) error {
 	fds := m.Descriptor().Fields()
 	fdSeconds := fds.ByNumber(genid.Duration_Seconds_field_number)
 	fdNanos := fds.ByNumber(genid.Duration_Nanos_field_number)
@@ -760,7 +762,7 @@ const (
 	minTimestampSeconds = -62135596800
 )
 
-func (e encoder) marshalTimestamp(m protoreflect.Message) error {
+func (e encoder) marshalTimestamp(m protoreflect.Message, v any) error {
 	fds := m.Descriptor().Fields()
 	fdSeconds := fds.ByNumber(genid.Timestamp_Seconds_field_number)
 	fdNanos := fds.ByNumber(genid.Timestamp_Nanos_field_number)
@@ -826,7 +828,7 @@ func (d decoder) unmarshalTimestamp(m protoreflect.Message) error {
 // lower-camel naming conventions. Encoding should fail if the path name would
 // end up differently after a round-trip.
 
-func (e encoder) marshalFieldMask(m protoreflect.Message) error {
+func (e encoder) marshalFieldMask(m protoreflect.Message, v any) error {
 	fd := m.Descriptor().Fields().ByNumber(genid.FieldMask_Paths_field_number)
 	list := m.Get(fd).List()
 	paths := make([]string, 0, list.Len())

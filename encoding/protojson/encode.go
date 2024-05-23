@@ -6,8 +6,14 @@ package protojson
 
 import (
 	"encoding/base64"
+	jsonstd "encoding/json"
 	"fmt"
+	"reflect"
+	"strings"
 
+	"github.com/fatih/structtag"
+	"github.com/gogo/protobuf/jsonpb"
+	gogoproto "github.com/gogo/protobuf/proto"
 	"google.golang.org/protobuf/internal/encoding/json"
 	"google.golang.org/protobuf/internal/encoding/messageset"
 	"google.golang.org/protobuf/internal/errors"
@@ -128,7 +134,7 @@ func (o MarshalOptions) Format(m proto.Message) string {
 // Do not depend on the output being stable. Its output will change across
 // different builds of your program, even when using the same version of the
 // protobuf module.
-func (o MarshalOptions) Marshal(m proto.Message) ([]byte, error) {
+func (o MarshalOptions) Marshal(m any) ([]byte, error) {
 	return o.marshal(nil, m)
 }
 
@@ -141,7 +147,7 @@ func (o MarshalOptions) MarshalAppend(b []byte, m proto.Message) ([]byte, error)
 // marshal is a centralized function that all marshal operations go through.
 // For profiling purposes, avoid changing the name of this function or
 // introducing other code paths for marshal that do not go through this.
-func (o MarshalOptions) marshal(b []byte, m proto.Message) ([]byte, error) {
+func (o MarshalOptions) marshal(b []byte, m any) ([]byte, error) {
 	if o.Multiline && o.Indent == "" {
 		o.Indent = defaultIndent
 	}
@@ -161,13 +167,13 @@ func (o MarshalOptions) marshal(b []byte, m proto.Message) ([]byte, error) {
 	}
 
 	enc := encoder{internalEnc, o}
-	if err := enc.marshalMessage(m.ProtoReflect(), ""); err != nil {
+	if err := enc.marshalMessage(m, ""); err != nil {
 		return nil, err
 	}
 	if o.AllowPartial {
 		return enc.Bytes(), nil
 	}
-	return enc.Bytes(), proto.CheckInitialized(m)
+	return enc.Bytes(), nil
 }
 
 type encoder struct {
@@ -234,13 +240,42 @@ func (m unpopulatedFieldRanger) Range(f func(protoreflect.FieldDescriptor, proto
 // marshalMessage marshals the fields in the given protoreflect.Message.
 // If the typeURL is non-empty, then a synthetic "@type" field is injected
 // containing the URL as the value.
-func (e encoder) marshalMessage(m protoreflect.Message, typeURL string) error {
-	if !flags.ProtoLegacy && messageset.IsMessageSet(m.Descriptor()) {
-		return errors.New("no support for proto1 MessageSets")
+func (e encoder) marshalMessage(msg any, typeURL string) error {
+	value := reflect.ValueOf(msg)
+	if value.Type().Kind() == reflect.Ptr {
+		value = value.Elem()
+	}
+	valueGogoProto, isGogoProto := msg.(gogoproto.Message)
+	valueProto, isProto := msg.(proto.Message)
+
+	var m protoreflect.Message
+	if isProto {
+		m = valueProto.ProtoReflect()
+
+		if marshal := wellKnownTypeMarshaler(m.Descriptor().FullName()); marshal != nil {
+			return marshal(e, m, msg)
+		}
+
+		if !flags.ProtoLegacy && messageset.IsMessageSet(m.Descriptor()) {
+			return errors.New("no support for proto1 MessageSets")
+		}
 	}
 
-	if marshal := wellKnownTypeMarshaler(m.Descriptor().FullName()); marshal != nil {
-		return marshal(e, m)
+	if !isProto {
+		if isGogoProto {
+			if pkgPath := value.Type().PkgPath(); strings.HasPrefix(pkgPath, "k8s.io/api/") || strings.HasPrefix(pkgPath, "k8s.io/apimachinery/") {
+				b, err := jsonstd.Marshal(msg)
+				if err != nil {
+					return err
+				}
+				return e.Write(b)
+			}
+			s, err := (&jsonpb.Marshaler{}).MarshalToString(valueGogoProto)
+			if err != nil {
+				return err
+			}
+			return e.Write([]byte(s))
+		}
 	}
 
 	e.StartObject()
@@ -267,7 +302,31 @@ func (e encoder) marshalMessage(m protoreflect.Message, typeURL string) error {
 		if err = e.WriteName(name); err != nil {
 			return false
 		}
-		if err = e.marshalValue(v, fd); err != nil {
+		val := value.FieldByNameFunc(func(n string) bool {
+			f, ok := value.Type().FieldByName(n)
+			if !ok {
+				return false
+			}
+			tags, err := structtag.Parse(string(f.Tag))
+			if err != nil {
+				return false
+			}
+			pbtag, err := tags.Get("protobuf")
+			if err != nil {
+				return false
+			}
+			for _, opt := range pbtag.Options {
+				if !strings.HasPrefix(opt, "name=") {
+					continue
+				}
+				pbname := strings.TrimPrefix(opt, "name=")
+				if pbname == fd.TextName() {
+					return true
+				}
+			}
+			return false
+		})
+		if err = e.marshalValue(v, val.Interface(), fd); err != nil {
 			return false
 		}
 		return true
@@ -276,20 +335,20 @@ func (e encoder) marshalMessage(m protoreflect.Message, typeURL string) error {
 }
 
 // marshalValue marshals the given protoreflect.Value.
-func (e encoder) marshalValue(val protoreflect.Value, fd protoreflect.FieldDescriptor) error {
+func (e encoder) marshalValue(val protoreflect.Value, v any, fd protoreflect.FieldDescriptor) error {
 	switch {
 	case fd.IsList():
-		return e.marshalList(val.List(), fd)
+		return e.marshalList(val.List(), v, fd)
 	case fd.IsMap():
-		return e.marshalMap(val.Map(), fd)
+		return e.marshalMap(val.Map(), v, fd)
 	default:
-		return e.marshalSingular(val, fd)
+		return e.marshalSingular(val, v, fd)
 	}
 }
 
 // marshalSingular marshals the given non-repeated field value. This includes
 // all scalar types, enums, messages, and groups.
-func (e encoder) marshalSingular(val protoreflect.Value, fd protoreflect.FieldDescriptor) error {
+func (e encoder) marshalSingular(val protoreflect.Value, v any, fd protoreflect.FieldDescriptor) error {
 	if !val.IsValid() {
 		e.WriteNull()
 		return nil
@@ -339,7 +398,7 @@ func (e encoder) marshalSingular(val protoreflect.Value, fd protoreflect.FieldDe
 		}
 
 	case protoreflect.MessageKind, protoreflect.GroupKind:
-		if err := e.marshalMessage(val.Message(), ""); err != nil {
+		if err := e.marshalMessage(v, ""); err != nil {
 			return err
 		}
 
@@ -350,13 +409,15 @@ func (e encoder) marshalSingular(val protoreflect.Value, fd protoreflect.FieldDe
 }
 
 // marshalList marshals the given protoreflect.List.
-func (e encoder) marshalList(list protoreflect.List, fd protoreflect.FieldDescriptor) error {
+func (e encoder) marshalList(list protoreflect.List, v any, fd protoreflect.FieldDescriptor) error {
 	e.StartArray()
 	defer e.EndArray()
 
+	value := reflect.ValueOf(v)
+
 	for i := 0; i < list.Len(); i++ {
 		item := list.Get(i)
-		if err := e.marshalSingular(item, fd); err != nil {
+		if err := e.marshalSingular(item, value.Index(i).Interface(), fd); err != nil {
 			return err
 		}
 	}
@@ -364,7 +425,7 @@ func (e encoder) marshalList(list protoreflect.List, fd protoreflect.FieldDescri
 }
 
 // marshalMap marshals given protoreflect.Map.
-func (e encoder) marshalMap(mmap protoreflect.Map, fd protoreflect.FieldDescriptor) error {
+func (e encoder) marshalMap(mmap protoreflect.Map, val any, fd protoreflect.FieldDescriptor) error {
 	e.StartObject()
 	defer e.EndObject()
 
@@ -373,7 +434,8 @@ func (e encoder) marshalMap(mmap protoreflect.Map, fd protoreflect.FieldDescript
 		if err = e.WriteName(k.String()); err != nil {
 			return false
 		}
-		if err = e.marshalSingular(v, fd.MapValue()); err != nil {
+		value := reflect.ValueOf(val)
+		if err = e.marshalSingular(v, value.MapIndex(reflect.ValueOf(k.String())).Interface(), fd.MapValue()); err != nil {
 			return false
 		}
 		return true

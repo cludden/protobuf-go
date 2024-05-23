@@ -59,6 +59,12 @@ func (e *Encoder) Bytes() []byte {
 	return e.out
 }
 
+func (e *Encoder) Write(b []byte) error {
+	e.prepareNext(scalar)
+	e.out = append(e.out, b...)
+	return nil
+}
+
 // WriteNull writes out the null value.
 func (e *Encoder) WriteNull() {
 	e.prepareNext(scalar)

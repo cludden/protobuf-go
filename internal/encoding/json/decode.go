@@ -64,6 +64,52 @@ func (d *Decoder) Peek() (Token, error) {
 	return d.lastToken, d.lastErr
 }
 
+func (d *Decoder) ReadObject() (result []byte, err error) {
+	orig := d.Clone().in
+
+	// initialize first token
+	if d.lastCall == peekCall {
+		orig = append(d.lastToken.raw, orig...)
+	}
+	tok, err := d.Read()
+	if err != nil {
+		return nil, err
+	}
+
+	var stack []Kind
+	for {
+
+		switch tok.kind {
+		case ObjectOpen:
+			stack = append(stack, ObjectOpen)
+		case ArrayOpen:
+			stack = append(stack, ArrayOpen)
+		case ArrayClose:
+			if k := stack[len(stack)-1]; k != ArrayOpen {
+				return nil, fmt.Errorf("expected ArrayOpen, found %s", k.String())
+			}
+			stack = stack[:len(stack)-1]
+		case ObjectClose:
+			if k := stack[len(stack)-1]; k != ObjectOpen {
+				return nil, fmt.Errorf("expected ObjectOpen, found %s", k.String())
+			}
+			stack = stack[:len(stack)-1]
+		default:
+
+		}
+		if len(stack) == 0 {
+			result = orig[:len(orig)-len(d.in)]
+			return result, nil
+		}
+
+		// initialize next token
+		tok, err = d.Read()
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
 // Read returns the next JSON token.
 // It will return an error if there is no valid token.
 func (d *Decoder) Read() (Token, error) {
